@@ -4,12 +4,13 @@
 #include <time.h>
 #include "rules.h"
 #include "json.h"
-#include "net.h"
+#include "rete.h"
 
 #define MAX_STATE_NODES 8
 #define MAX_MESSAGE_NODES 16
 #define MAX_LEFT_FRAME_NODES 8
 #define MAX_RIGHT_FRAME_NODES 8
+#define MAX_LOCATION_NODES 16
 
 // The first node is never used as it corresponds to UNDEFINED_HASH_OFFSET
 #define INIT(type, pool, length) do { \
@@ -29,8 +30,8 @@
     pool.count = 0; \
 } while(0)
 
-#define GET(type, index, max, pool, nodeHash, valueOffset) do { \
-    valueOffset = index[nodeHash % max]; \
+#define GET_FIRST(type, index, max, pool, nodeHash, valueOffset) do { \
+    valueOffset = index[(nodeHash % max) * 2]; \
     while (valueOffset != UNDEFINED_HASH_OFFSET) { \
         type *value = &((type *)pool.content)[valueOffset]; \
         if (value->hash != nodeHash) { \
@@ -41,22 +42,35 @@
     } \
 } while(0)
 
+#define GET_LAST(type, index, max, pool, nodeHash, valueOffset) do { \
+    valueOffset = index[(nodeHash % max) * 2 + 1]; \
+    while (valueOffset != UNDEFINED_HASH_OFFSET) { \
+        type *value = &((type *)pool.content)[valueOffset]; \
+        if (value->hash != nodeHash) { \
+            valueOffset = value->prevOffset; \
+        } else { \
+            break; \
+        } \
+    } \
+} while(0)
+
 #define NEW(type, pool, valueOffset) do { \
     valueOffset = pool.freeOffset; \
     type *value = &((type *)pool.content)[valueOffset]; \
     if (value->nextOffset == UNDEFINED_HASH_OFFSET) { \
-        pool.content = realloc(pool.content, (pool.contentLength * 2) * sizeof(type)); \
+        pool.content = realloc(pool.content, (pool.contentLength * 1.5) * sizeof(type)); \
         if (!pool.content) { \
             return ERR_OUT_OF_MEMORY; \
         } \
-        for (unsigned int i = pool.contentLength; i < pool.contentLength * 2; ++ i) { \
+        for (unsigned int i = pool.contentLength; i < pool.contentLength * 1.5; ++ i) { \
             ((type *)pool.content)[i].isActive = 0; \
             ((type *)pool.content)[i].nextOffset = i + 1; \
             ((type *)pool.content)[i].prevOffset = i - 1; \
         } \
+        value = &((type *)pool.content)[valueOffset]; \
         value->nextOffset = pool.contentLength; \
         ((type *)pool.content)[pool.contentLength].prevOffset = valueOffset; \
-        pool.contentLength *= 2; \
+        pool.contentLength *= 1.5; \
         ((type *)pool.content)[pool.contentLength - 1].nextOffset = UNDEFINED_HASH_OFFSET; \
     } \
     ((type *)pool.content)[value->nextOffset].prevOffset = UNDEFINED_HASH_OFFSET; \
@@ -71,10 +85,12 @@
     type *value = &((type *)pool.content)[valueOffset]; \
     value->hash = nodeHash; \
     value->prevOffset = UNDEFINED_HASH_OFFSET; \
-    value->nextOffset = index[nodeHash % max]; \
-    index[nodeHash % max] = valueOffset; \
+    value->nextOffset = index[(nodeHash % max) * 2]; \
+    index[(nodeHash % max) * 2] = valueOffset; \
     if (value->nextOffset != UNDEFINED_HASH_OFFSET) { \
         ((type *)pool.content)[value->nextOffset].prevOffset = valueOffset; \
+    } else { \
+        index[(nodeHash % max) * 2 + 1] = valueOffset; \
     } \
 } while(0)
 
@@ -84,12 +100,14 @@
         return ERR_NODE_DELETED; \
     } \
     if (value->prevOffset == UNDEFINED_HASH_OFFSET) { \
-        index[value->hash % max] = value->nextOffset; \
+        index[(value->hash % max) * 2] = value->nextOffset; \
     } else { \
         type *prevValue = &((type *)pool.content)[value->prevOffset]; \
         prevValue->nextOffset = value->nextOffset; \
     } \
-    if (value->nextOffset != UNDEFINED_HASH_OFFSET) { \
+    if (value->nextOffset == UNDEFINED_HASH_OFFSET) { \
+        index[(value->hash % max) * 2 + 1] = value->prevOffset; \
+    } else { \
         type *nextValue = &((type *)pool.content)[value->nextOffset]; \
         nextValue->prevOffset = value->prevOffset; \
     } \
@@ -125,22 +143,101 @@ unsigned int getHash(char *sid, char *key) {
     return fnv1Hash32(fullKey, fullKeyLength - 1);
 }
 
+unsigned int getLocationHash(frameLocation location) {
+    unsigned int hash = FNV_32_OFFSET_BASIS;
+    hash ^= location.frameType;
+    hash *= FNV_32_PRIME;
+    hash ^= location.nodeIndex;
+    hash *= FNV_32_PRIME;
+    hash ^= location.frameOffset;
+    hash *= FNV_32_PRIME;
+
+    return hash;
+}
+
 unsigned int initStatePool(void *tree) {
     INIT(stateNode, ((ruleset*)tree)->statePool, MAX_STATE_NODES);
     return RULES_OK;
 }
 
-unsigned int appendFrameLocation(stateNode *state,
-                                 frameLocation location,
-                                 unsigned int messageNodeOffset) { 
-    messageNode *currentNode = MESSAGE_NODE(state, messageNodeOffset);
-    if (currentNode->locationCount == MAX_FRAME_LOCATIONS) {
-        return ERR_MAX_FRAME_LOCATIONS;
+unsigned int addFrameLocation(stateNode *state,
+                              frameLocation location,
+                              unsigned int messageNodeOffset) { 
+    messageNode *message = MESSAGE_NODE(state, messageNodeOffset);
+    unsigned int locationNodeOffset;
+    NEW(locationNode, 
+        message->locationPool, 
+        locationNodeOffset);
+    
+    locationNode *newLocationNode = LOCATION_NODE(message, locationNodeOffset);
+    newLocationNode->location.frameType = location.frameType;
+    newLocationNode->location.nodeIndex = location.nodeIndex;
+    newLocationNode->location.frameOffset = location.frameOffset;
+    
+    unsigned int hash = getLocationHash(newLocationNode->location);
+    SET(locationNode, 
+        message->locationIndex, 
+        MAX_LOCATION_INDEX_LENGTH, 
+        message->locationPool, 
+        hash, 
+        locationNodeOffset);
+
+    return RULES_OK;
+}
+
+unsigned int deleteFrameLocation(stateNode *state,
+                                 unsigned int messageNodeOffset,
+                                 frameLocation location) {
+    messageNode *message = MESSAGE_NODE(state, messageNodeOffset);
+    if (!message->isActive) {
+        return RULES_OK;
     }
-    currentNode->locations[currentNode->locationCount].frameType = location.frameType;
-    currentNode->locations[currentNode->locationCount].nodeIndex = location.nodeIndex;
-    currentNode->locations[currentNode->locationCount].frameOffset = location.frameOffset;
-    ++currentNode->locationCount;
+
+    unsigned int hash = getLocationHash(location);
+    unsigned int locationNodeOffset;
+    GET_FIRST(locationNode, 
+              message->locationIndex, 
+              MAX_LOCATION_INDEX_LENGTH, 
+              message->locationPool, 
+              hash, 
+              locationNodeOffset);
+    
+    while (locationNodeOffset != UNDEFINED_HASH_OFFSET) {
+        locationNode *newLocationNode = LOCATION_NODE(message, locationNodeOffset);
+        if (newLocationNode->hash != hash) {
+            locationNodeOffset = UNDEFINED_HASH_OFFSET;
+        } else {
+            if (newLocationNode->location.frameType == location.frameType &&
+                newLocationNode->location.nodeIndex == location.nodeIndex &&
+                newLocationNode->location.frameOffset == location.frameOffset) {
+                DELETE(locationNode,
+                       message->locationIndex, 
+                       MAX_LOCATION_INDEX_LENGTH,
+                       message->locationPool,
+                       locationNodeOffset);
+
+                return RULES_OK;
+            }
+        
+            locationNodeOffset = newLocationNode->nextOffset;
+        }
+    }
+
+    return RULES_OK;
+}
+
+unsigned int deleteMessageFromFrame(unsigned int messageNodeOffset, 
+                                    leftFrameNode *frame) {
+
+    for (int i = 0, c = 0; c < frame->messageCount; ++i) {
+        if (frame->messages[i].hash) {
+            ++c;
+            if (frame->messages[i].messageNodeOffset == messageNodeOffset) {
+                frame->messages[i].hash = 0;
+                frame->messages[i].messageNodeOffset = UNDEFINED_HASH_OFFSET;
+            }
+        }
+    }
 
     return RULES_OK;
 }
@@ -190,20 +287,21 @@ unsigned int setMessageInFrame(leftFrameNode *node,
     return RULES_OK;   
 }
 
-unsigned int getLeftFrame(stateNode *state,
+unsigned int getLastLeftFrame(stateNode *state,
                           unsigned int index, 
                           unsigned int hash, 
                           frameLocation *location,
                           leftFrameNode **node) {
     unsigned int valueOffset;
-    GET(leftFrameNode, 
-        state->betaState[index].leftFrameIndex, 
-        MAX_LEFT_FRAME_INDEX_LENGTH, 
-        state->betaState[index].leftFramePool, 
-        hash, 
-        valueOffset);
+    GET_LAST(leftFrameNode, 
+             state->betaState[index].leftFrameIndex, 
+             MAX_LEFT_FRAME_INDEX_LENGTH, 
+             state->betaState[index].leftFramePool, 
+             hash, 
+             valueOffset);
     if (valueOffset == UNDEFINED_HASH_OFFSET) {
-        return ERR_FRAME_NOT_FOUND;
+        *node = NULL;
+        return RULES_OK;
     }
 
     *node = LEFT_FRAME_NODE(state, index, valueOffset);
@@ -250,9 +348,9 @@ static unsigned int copyLeftFrame(stateNode *state,
         memcpy(targetNode->reverseIndex, oldNode->reverseIndex, MAX_MESSAGE_FRAMES * sizeof(unsigned short));
         targetNode->messageCount = oldNode->messageCount;
         for (unsigned short i = 0; i < targetNode->messageCount; ++i) {
-            CHECK_RESULT(appendFrameLocation(state,
-                                             newLocation, 
-                                             targetNode->messages[targetNode->reverseIndex[i]].messageNodeOffset));
+            CHECK_RESULT(addFrameLocation(state,
+                                          newLocation, 
+                                          targetNode->messages[targetNode->reverseIndex[i]].messageNodeOffset));
         }
     } 
 
@@ -274,6 +372,7 @@ unsigned int createLeftFrame(stateNode *state,
     newLocation->nodeIndex = reteNode->value.b.index;
     newLocation->frameOffset = newValueOffset;
     targetNode->nameOffset = reteNode->nameOffset;
+    targetNode->isDispatching = 0;
     
     CHECK_RESULT(copyLeftFrame(state,
                                oldNode, 
@@ -285,17 +384,131 @@ unsigned int createLeftFrame(stateNode *state,
     return RULES_OK;
 }
 
+unsigned int getLastConnectorFrame(stateNode *state,
+                                   unsigned int frameType,
+                                   unsigned int index, 
+                                   unsigned int *valueOffset,
+                                   leftFrameNode **node) {
+    if (frameType == A_FRAME) {
+        GET_LAST(leftFrameNode, 
+                 state->connectorState[index].aFrameIndex, 
+                 1, 
+                 state->connectorState[index].aFramePool, 
+                 0, 
+                 *valueOffset);
+        if (*valueOffset == UNDEFINED_HASH_OFFSET) {
+            *node = NULL;
+            return RULES_OK;
+        }
+
+        *node = A_FRAME_NODE(state, index, *valueOffset);
+    } else {
+        GET_LAST(leftFrameNode, 
+                 state->connectorState[index].bFrameIndex, 
+                 1, 
+                 state->connectorState[index].bFramePool, 
+                 0, 
+                 *valueOffset);
+        if (*valueOffset == UNDEFINED_HASH_OFFSET) {
+            *node = NULL;
+            return RULES_OK;
+        }
+
+        *node = B_FRAME_NODE(state, index, *valueOffset);
+    }
+
+    return RULES_OK;
+}
+
+unsigned int setConnectorFrame(stateNode *state, 
+                               unsigned int frameType,
+                               frameLocation location) {
+    if (frameType == A_FRAME) {
+        SET(leftFrameNode, 
+            state->connectorState[location.nodeIndex].aFrameIndex, 
+            1, 
+            state->connectorState[location.nodeIndex].aFramePool, 
+            0, 
+            location.frameOffset);
+    } else {
+        SET(leftFrameNode, 
+            state->connectorState[location.nodeIndex].bFrameIndex, 
+            1, 
+            state->connectorState[location.nodeIndex].bFramePool, 
+            0, 
+            location.frameOffset);
+    }
+
+    return RULES_OK;
+}
+
+unsigned int deleteConnectorFrame(stateNode *state,
+                                  unsigned int frameType,
+                                  frameLocation location) {
+    if (frameType == A_FRAME) {
+        DELETE(leftFrameNode,
+               state->connectorState[location.nodeIndex].aFrameIndex, 
+               1,
+               state->connectorState[location.nodeIndex].aFramePool,
+               location.frameOffset);
+    } else {
+        DELETE(leftFrameNode,
+               state->connectorState[location.nodeIndex].bFrameIndex, 
+               1,
+               state->connectorState[location.nodeIndex].bFramePool,
+               location.frameOffset);
+
+    }
+
+    return RULES_OK;
+}
+
+unsigned int createConnectorFrame(stateNode *state,
+                                  unsigned int frameType,
+                                  node *reteNode,
+                                  leftFrameNode *oldNode,                        
+                                  leftFrameNode **newNode,
+                                  frameLocation *newLocation) {
+    unsigned int newValueOffset;
+    leftFrameNode *targetNode = NULL;
+    if (frameType == A_FRAME) {
+        NEW(leftFrameNode, 
+            state->connectorState[reteNode->value.b.index].aFramePool, 
+            newValueOffset);
+
+        targetNode = A_FRAME_NODE(state, reteNode->value.b.index, newValueOffset);
+    } else {
+        NEW(leftFrameNode, 
+            state->connectorState[reteNode->value.b.index].bFramePool, 
+            newValueOffset);
+
+        targetNode = B_FRAME_NODE(state, reteNode->value.b.index, newValueOffset);
+    }
+
+    newLocation->frameType = frameType;
+    newLocation->nodeIndex = reteNode->value.b.index;
+    newLocation->frameOffset = newValueOffset;
+    targetNode->nameOffset = reteNode->nameOffset;
+    targetNode->isDispatching = 0;
+    
+    CHECK_RESULT(copyLeftFrame(state,
+                               oldNode, 
+                               targetNode, 
+                               *newLocation));
+    
+    *newNode = targetNode;
+    state->connectorState[reteNode->value.b.index].reteNode = reteNode;
+    return RULES_OK;
+}
+
 unsigned int getActionFrame(stateNode *state,
-                            unsigned int index, 
-                            frameLocation *resultLocation,
+                            frameLocation resultLocation,
                             leftFrameNode **resultNode) {
-    actionStateNode *resultStateNode = &state->actionState[index];
-    unsigned int resultFrameOffset = resultStateNode->resultIndex[0];
-    *resultNode = RESULT_FRAME(resultStateNode, resultFrameOffset);
-    if (resultLocation) {
-        resultLocation->frameType = ACTION_FRAME;
-        resultLocation->nodeIndex = index;
-        resultLocation->frameOffset = resultFrameOffset;
+    actionStateNode *resultStateNode = &state->actionState[resultLocation.nodeIndex];
+    *resultNode = RESULT_FRAME(resultStateNode, resultLocation.frameOffset);
+    if (!(*resultNode)->isActive) {
+        *resultNode = NULL;
+        return ERR_NODE_DELETED;
     }
     return RULES_OK;
 }
@@ -304,18 +517,34 @@ unsigned int setActionFrame(stateNode *state,
                             frameLocation location) {
     SET(leftFrameNode, 
         state->actionState[location.nodeIndex].resultIndex, 
-        MAX_LEFT_FRAME_INDEX_LENGTH, 
+        1, 
         state->actionState[location.nodeIndex].resultPool, 
         0, 
         location.frameOffset);
     return RULES_OK;
 }
 
-unsigned int deleteActionFrame(stateNode *state,
-                               frameLocation location) {
+unsigned int deleteDispatchingActionFrame(stateNode *state,
+                                          frameLocation location) {    
     DELETE(leftFrameNode,
            state->actionState[location.nodeIndex].resultIndex, 
-           MAX_LEFT_FRAME_INDEX_LENGTH,
+           1,
+           state->actionState[location.nodeIndex].resultPool,
+           location.frameOffset);
+    return RULES_OK;
+}
+
+unsigned int deleteActionFrame(stateNode *state,
+                               frameLocation location) {    
+
+    leftFrameNode *targetNode = ACTION_FRAME_NODE(state, location.nodeIndex, location.frameOffset);
+    if (targetNode->isDispatching) {
+        return ERR_NODE_DISPATCHING;
+    }
+
+    DELETE(leftFrameNode,
+           state->actionState[location.nodeIndex].resultIndex, 
+           1,
            state->actionState[location.nodeIndex].resultPool,
            location.frameOffset);
     return RULES_OK;
@@ -337,7 +566,8 @@ unsigned int createActionFrame(stateNode *state,
     newLocation->nodeIndex = reteNode->value.c.index;
     newLocation->frameOffset = newValueOffset;
     targetNode->nameOffset = reteNode->nameOffset;
-
+    targetNode->isDispatching = 0;
+    
     CHECK_RESULT(copyLeftFrame(state,
                                oldNode, 
                                targetNode, 
@@ -348,19 +578,20 @@ unsigned int createActionFrame(stateNode *state,
     return RULES_OK;
 }
 
-unsigned int getRightFrame(stateNode *state,
+unsigned int getLastRightFrame(stateNode *state,
                            unsigned int index, 
                            unsigned int hash, 
                            rightFrameNode **node) {
     unsigned int valueOffset;
-    GET(rightFrameNode, 
-        state->betaState[index].rightFrameIndex, 
-        MAX_RIGHT_FRAME_INDEX_LENGTH, 
-        state->betaState[index].rightFramePool, 
-        hash, 
-        valueOffset);
+    GET_LAST(rightFrameNode, 
+             state->betaState[index].rightFrameIndex, 
+             MAX_RIGHT_FRAME_INDEX_LENGTH, 
+             state->betaState[index].rightFramePool, 
+             hash, 
+             valueOffset);
     if (valueOffset == UNDEFINED_HASH_OFFSET) {
-        return ERR_FRAME_NOT_FOUND;
+        *node = NULL;
+        return RULES_OK;
     }
 
     *node = RIGHT_FRAME_NODE(state, index, valueOffset);
@@ -407,32 +638,20 @@ unsigned int createRightFrame(stateNode *state,
     return RULES_OK;
 }
 
-unsigned int deleteLocationFromMessage(stateNode *state,
-                                       unsigned int messageNodeOffset,
-                                       frameLocation location) {
-
-    messageNode *message = MESSAGE_NODE(state, messageNodeOffset);
-
-    for (unsigned short i = 0; i < message->locationCount; ++i) {
-        if (message->locations[i].frameType == location.frameType &&
-            message->locations[i].nodeIndex == location.nodeIndex &&
-            message->locations[i].frameOffset == location.frameOffset) {
-
-            --message->locationCount;
-            memcpy(&message->locations[i], 
-                   &message->locations[i + 1], 
-                   (message->locationCount - i) * sizeof(frameLocation));
-        }
-    }
-
-    return RULES_OK;
-}
-
 unsigned int deleteMessage(stateNode *state,
                            unsigned int messageNodeOffset) {
+
+    messageNode *node = MESSAGE_NODE(state, messageNodeOffset);
+    if (node->jo.content) {
+        free(node->jo.content);
+        free(node->locationPool.content);
+        node->jo.content = NULL;
+        node->locationPool.content = NULL;
+    }
+    
     DELETE(messageNode,
            state->messageIndex, 
-           MAX_MESSAGE_NODES,
+           MAX_MESSAGE_INDEX_LENGTH,
            state->messagePool,
            messageNodeOffset);
     return RULES_OK;
@@ -441,14 +660,15 @@ unsigned int deleteMessage(stateNode *state,
 unsigned int getMessage(stateNode *state,
                         char *mid,
                         unsigned int *valueOffset) {
+    *valueOffset = UNDEFINED_HASH_OFFSET;
     unsigned int hash = fnv1Hash32(mid, strlen(mid));
 
-    GET(messageNode, 
-        state->messageIndex, 
-        MAX_MESSAGE_INDEX_LENGTH, 
-        state->messagePool, 
-        hash, 
-        *valueOffset);
+    GET_FIRST(messageNode, 
+              state->messageIndex, 
+              MAX_MESSAGE_INDEX_LENGTH, 
+              state->messagePool, 
+              hash, 
+              *valueOffset);
 
     return RULES_OK;
 }
@@ -462,7 +682,6 @@ static unsigned int copyMessage(jsonObject *targetMessage,
         return ERR_OUT_OF_MEMORY;
     }
     memcpy(targetMessage->content, sourceMessage->content, messageLength);
-    
     for (unsigned int i = 0; i < targetMessage->propertiesLength; ++i) {
         if (targetMessage->properties[i].type == JSON_STRING &&
             targetMessage->properties[i].hash != HASH_SID && 
@@ -470,7 +689,6 @@ static unsigned int copyMessage(jsonObject *targetMessage,
             targetMessage->properties[i].value.s = targetMessage->content + targetMessage->properties[i].valueOffset;
         }
     }
-
     return RULES_OK;
 }
 
@@ -479,8 +697,19 @@ unsigned int storeMessage(stateNode *state,
                           jsonObject *message,
                           unsigned char messageType,
                           unsigned int *valueOffset) {
-    
     unsigned int hash = fnv1Hash32(mid, strlen(mid));
+    *valueOffset = UNDEFINED_HASH_OFFSET;
+
+    GET_FIRST(messageNode, 
+              state->messageIndex, 
+              MAX_MESSAGE_INDEX_LENGTH, 
+              state->messagePool, 
+              hash, 
+              *valueOffset);
+
+    if (*valueOffset != UNDEFINED_HASH_OFFSET) {
+        return ERR_EVENT_OBSERVED;
+    }
 
     NEW(messageNode, 
         state->messagePool, 
@@ -489,11 +718,17 @@ unsigned int storeMessage(stateNode *state,
     SET(messageNode, 
         state->messageIndex, 
         MAX_MESSAGE_INDEX_LENGTH, 
-        state->messagePool, hash, 
+        state->messagePool, 
+        hash, 
         *valueOffset);
 
     messageNode *node = MESSAGE_NODE(state, *valueOffset);
-    node->locationCount = 0;
+    INIT(locationNode, 
+         node->locationPool, 
+         MAX_LOCATION_NODES);
+
+    memset(node->locationIndex, 0, MAX_LOCATION_INDEX_LENGTH * sizeof(unsigned int) * 2);
+
     node->messageType = messageType;
     return copyMessage(&node->jo, message);
 }
@@ -505,39 +740,100 @@ unsigned int ensureStateNode(void *tree,
     unsigned int sidHash = fnv1Hash32(sid, strlen(sid));
     unsigned int nodeOffset;
     ruleset *rulesetTree = (ruleset*)tree;
-    GET(stateNode, rulesetTree->stateIndex, MAX_STATE_INDEX_LENGTH, ((ruleset*)tree)->statePool, sidHash, nodeOffset);
+
+    GET_FIRST(stateNode, 
+              rulesetTree->stateIndex, 
+              MAX_STATE_INDEX_LENGTH, 
+              ((ruleset*)tree)->statePool, 
+              sidHash, 
+              nodeOffset);
+
     if (nodeOffset != UNDEFINED_HASH_OFFSET) {
         *isNew = 0;
         *state = STATE_NODE(tree, nodeOffset); 
     } else {
         *isNew = 1;
-        NEW(stateNode, rulesetTree->statePool, nodeOffset);
-        SET(stateNode, rulesetTree->stateIndex, MAX_STATE_INDEX_LENGTH, rulesetTree->statePool, sidHash, nodeOffset);
+        NEW(stateNode, 
+            rulesetTree->statePool, 
+            nodeOffset);
+
+        SET(stateNode, 
+            rulesetTree->stateIndex, 
+            MAX_STATE_INDEX_LENGTH, 
+            rulesetTree->statePool, 
+            sidHash, 
+            nodeOffset);
+
         rulesetTree->reverseStateIndex[rulesetTree->statePool.count - 1] = nodeOffset;
         stateNode *node = STATE_NODE(tree, nodeOffset); 
-    
-        CHECK_RESULT(getBindingIndex(tree, sidHash, &node->bindingIndex));
-        INIT(messageNode, node->messagePool, MAX_MESSAGE_NODES);
-        memset(node->messageIndex, 0, MAX_MESSAGE_INDEX_LENGTH * sizeof(unsigned int));
+        node->offset = nodeOffset;
+
+        int sidLength = sizeof(char) * (strlen(sid) + 1);
+        node->sid = malloc(sidLength);
+        if (!node->sid) {
+            return ERR_OUT_OF_MEMORY;
+        }
+        memcpy(node->sid, sid, sidLength);
+
+        INIT(messageNode, 
+             node->messagePool, 
+             MAX_MESSAGE_NODES);
+
+        memset(node->messageIndex, 0, MAX_MESSAGE_INDEX_LENGTH * sizeof(unsigned int) * 2);
         
         node->betaState = malloc(((ruleset*)tree)->betaCount * sizeof(betaStateNode));
         for (unsigned int i = 0; i < ((ruleset*)tree)->betaCount; ++i) {
             betaStateNode *betaNode = &node->betaState[i];
-            INIT(leftFrameNode, betaNode->leftFramePool, MAX_LEFT_FRAME_NODES);
-            memset(betaNode->leftFrameIndex, 0, MAX_LEFT_FRAME_INDEX_LENGTH * sizeof(unsigned int));
+            betaNode->reteNode = NULL;
+
+            INIT(leftFrameNode, 
+                 betaNode->leftFramePool, 
+                 MAX_LEFT_FRAME_NODES);
+
+            memset(betaNode->leftFrameIndex, 0, MAX_LEFT_FRAME_INDEX_LENGTH * sizeof(unsigned int) * 2);
             
-            INIT(rightFrameNode, betaNode->rightFramePool, MAX_RIGHT_FRAME_NODES);
-            memset(betaNode->rightFrameIndex, 0, MAX_RIGHT_FRAME_INDEX_LENGTH * sizeof(unsigned int));
+            INIT(rightFrameNode, 
+                 betaNode->rightFramePool, 
+                 MAX_RIGHT_FRAME_NODES);
+
+            memset(betaNode->rightFrameIndex, 0, MAX_RIGHT_FRAME_INDEX_LENGTH * sizeof(unsigned int) * 2);
+        }
+
+        node->connectorState = malloc(((ruleset*)tree)->connectorCount * sizeof(connectorStateNode));
+        for (unsigned int i = 0; i < ((ruleset*)tree)->connectorCount; ++i) {
+            connectorStateNode *connectorNode = &node->connectorState[i];
+            connectorNode->reteNode = NULL;
+
+            INIT(leftFrameNode, 
+                 connectorNode->aFramePool, 
+                 MAX_LEFT_FRAME_NODES);
+ 
+            connectorNode->aFrameIndex[0] = UNDEFINED_HASH_OFFSET;
+            connectorNode->aFrameIndex[1] = UNDEFINED_HASH_OFFSET;
+
+            INIT(leftFrameNode, 
+                 connectorNode->bFramePool, 
+                 MAX_LEFT_FRAME_NODES);
+
+            connectorNode->bFrameIndex[0] = UNDEFINED_HASH_OFFSET;
+            connectorNode->bFrameIndex[1] = UNDEFINED_HASH_OFFSET;
         }
 
         node->actionState = malloc(((ruleset*)tree)->actionCount * sizeof(actionStateNode));
         for (unsigned int i = 0; i < ((ruleset*)tree)->actionCount; ++i) {
             actionStateNode *actionNode = &node->actionState[i];
+            actionNode->reteNode = NULL;
+            
             actionNode->resultIndex[0] = UNDEFINED_HASH_OFFSET;
-            INIT(leftFrameNode, actionNode->resultPool, MAX_LEFT_FRAME_NODES);
+            actionNode->resultIndex[1] = UNDEFINED_HASH_OFFSET;
+
+            INIT(leftFrameNode, 
+                 actionNode->resultPool, 
+                 MAX_LEFT_FRAME_NODES);
         }        
 
         node->factOffset = UNDEFINED_HASH_OFFSET;
+        node->lockExpireTime = 0;
         *state = node;
     }
     
@@ -579,18 +875,18 @@ static void serializeResultFrame(ruleset *tree,
         char *value = currentNode->jo.content;
         if (i < (frame->messageCount -1)) {
             tupleLength = strlen(name) + strlen(value) + 5;
-            #ifdef _WIN32
+#ifdef _WIN32
                 sprintf_s(first, tupleLength, "\"%s\":%s,", name, value);
-            #else
+#else
                 snprintf(first, tupleLength, "\"%s\":%s,", name, value);
-            #endif
+#endif
         } else {
             tupleLength = strlen(name) + strlen(value) + 4;
-            #ifdef _WIN32
+#ifdef _WIN32
                 sprintf_s(first, tupleLength, "\"%s\":%s", name, value);
-            #else
+#else
                 snprintf(first, tupleLength, "\"%s\":%s", name, value);
-            #endif
+#endif
         }
 
         first += (tupleLength - 1); 
@@ -603,18 +899,15 @@ static void serializeResultFrame(ruleset *tree,
 unsigned int serializeResult(void *tree, 
                              stateNode *state, 
                              actionStateNode *actionNode, 
+                             unsigned int count,
                              char **result) {
-    unsigned int count;
-    if (actionNode->reteNode->value.c.count) {
-        count = actionNode->reteNode->value.c.count;
-    } else {
-        count = (actionNode->reteNode->value.c.cap > actionNode->resultPool.count ? 
-                 actionNode->resultPool.count : 
-                 actionNode->reteNode->value.c.cap);
-    }
-
+    
     if (actionNode->reteNode->value.c.count && count == 1) {
         leftFrameNode *resultFrame = RESULT_FRAME(actionNode, actionNode->resultIndex[0]);
+        if (!resultFrame->isActive) {
+            return ERR_NODE_DELETED;
+        }
+
         char *actionName = &((ruleset *)tree)->stringPool[resultFrame->nameOffset];
         unsigned int resultLength = strlen(actionName) + 6 + getResultFrameLength(tree, 
                                                                                   state, 
@@ -635,6 +928,7 @@ unsigned int serializeResult(void *tree,
         first += tupleLength - 1;
 
         char *last;
+        resultFrame->isDispatching = 1;
         serializeResultFrame(tree, 
                              state, 
                              resultFrame, 
@@ -644,6 +938,10 @@ unsigned int serializeResult(void *tree,
         last[1] = 0;
     } else {
         leftFrameNode *resultFrame = RESULT_FRAME(actionNode, actionNode->resultIndex[0]);
+        if (!resultFrame->isActive) {
+            return ERR_NODE_DELETED;
+        }
+
         char *actionName = &((ruleset *)tree)->stringPool[resultFrame->nameOffset];
         unsigned int resultLength = strlen(actionName) + 8;
         for (unsigned int currentCount = 0; currentCount < count; ++currentCount) {
@@ -675,6 +973,7 @@ unsigned int serializeResult(void *tree,
         char *last;
         resultFrame = RESULT_FRAME(actionNode, actionNode->resultIndex[0]);
         for (unsigned int currentCount = 0; currentCount < count; ++currentCount) {
+            resultFrame->isDispatching = 1;
             serializeResultFrame(tree, 
                                  state, 
                                  resultFrame, 
@@ -713,25 +1012,67 @@ unsigned int serializeState(stateNode *state,
     return RULES_OK;
 }
 
+unsigned int getNextResultInState(void *tree, 
+                                  stateNode *state,
+                                  unsigned int *actionStateIndex,
+                                  unsigned int *resultCount,
+                                  unsigned int *resultFrameOffset, 
+                                  actionStateNode **resultAction) {
+
+    ruleset *rulesetTree = (ruleset*)tree;
+    *resultAction = NULL;
+    for (unsigned int index = 0; index < rulesetTree->actionCount; ++index) {
+        actionStateNode *actionNode = &state->actionState[index];
+        if (actionNode->reteNode) {
+            if ((actionNode->reteNode->value.c.cap && actionNode->resultPool.count) ||
+                (actionNode->reteNode->value.c.count && actionNode->resultPool.count >= actionNode->reteNode->value.c.count)) {
+                *resultAction = actionNode;
+                *actionStateIndex = index;
+                *resultFrameOffset = actionNode->resultIndex[0];
+                if (actionNode->reteNode->value.c.count) {
+                    *resultCount = actionNode->reteNode->value.c.count;
+                } else {
+                    *resultCount = (actionNode->reteNode->value.c.cap > actionNode->resultPool.count ? 
+                                    actionNode->resultPool.count : 
+                                    actionNode->reteNode->value.c.cap);
+                }
+
+                return RULES_OK;
+            }
+        }
+    }
+
+    return ERR_NO_ACTION_AVAILABLE;
+}
 
 unsigned int getNextResult(void *tree, 
+                           time_t currentTime,
                            stateNode **resultState, 
-                           unsigned int *actionIndex,
+                           unsigned int *actionStateIndex,
+                           unsigned int *resultCount,
+                           unsigned int *resultFrameOffset, 
                            actionStateNode **resultAction) {
     unsigned int count = 0;
     ruleset *rulesetTree = (ruleset*)tree;
     *resultAction = NULL;
+    
+    // In case state pool has been modified.
+    if (rulesetTree->statePool.count) {
+        rulesetTree->currentStateIndex = rulesetTree->currentStateIndex % rulesetTree->statePool.count;
+    }
+
     while (count < rulesetTree->statePool.count && !*resultAction) {
         unsigned int nodeOffset = rulesetTree->reverseStateIndex[rulesetTree->currentStateIndex];
-        stateNode *state = STATE_NODE(tree, nodeOffset); 
-        for (unsigned int index = 0; index < rulesetTree->actionCount; ++index) {
-            actionStateNode *actionNode = &state->actionState[index];
-            if ((actionNode->reteNode->value.c.cap && actionNode->resultPool.count) ||
-                (actionNode->reteNode->value.c.count && actionNode->resultPool.count >= actionNode->reteNode->value.c.count)) {
-                *resultState = state;
-                *resultAction = actionNode;
-                *actionIndex = index;
-                return RULES_OK;
+        *resultState = STATE_NODE(tree, nodeOffset);
+        if (currentTime - (*resultState)->lockExpireTime > STATE_LEASE_TIME) { 
+            unsigned int result = getNextResultInState(tree,
+                                                       *resultState,
+                                                       actionStateIndex,
+                                                       resultCount,
+                                                       resultFrameOffset,
+                                                       resultAction);
+            if (result != ERR_NO_ACTION_AVAILABLE) {
+                return result;
             }
         }
 
@@ -777,33 +1118,37 @@ static void radixSortProperties(jsonObject *jo, jsonProperty **properties) {
     }
 }
 
-static void calculateId(jsonObject *jo) {
+unsigned int calculateId(jsonObject *jo) {
 
 #ifdef _WIN32
     jsonProperty **properties = (jsonProperty *)_alloca(sizeof(jsonProperty *) * (jo->propertiesLength));
 #else
     jsonProperty *properties[jo->propertiesLength];
 #endif
-
+    
     radixSortProperties(jo, properties);
     insertSortProperties(jo, properties);
 
     unsigned long long hash = FNV_64_OFFSET_BASIS;
     for (unsigned short i = 0; i < jo->propertiesLength; ++i) {
         jsonProperty *property = properties[i];
-
-        //TODO: is this valid?
-        hash ^= property->hash;
-        hash *= FNV_64_PRIME;
-    
-        unsigned short valueLength = property->valueLength;
-        if (property->type != JSON_STRING) {
-            ++valueLength;
-        }
-
-        for (unsigned short ii = 0; ii < valueLength; ++ii) {
-            hash ^= jo->content[property->valueOffset + ii];
+        if (property->hash != HASH_ID) {
+            hash ^= property->hash;
             hash *= FNV_64_PRIME;
+        
+            unsigned short valueLength = property->valueLength;
+            if (property->type == JSON_STRING) {
+                // Using value.s to cover generated sid
+                for (unsigned short ii = 0; ii < valueLength; ++ii) {
+                    hash ^= property->value.s[ii];
+                    hash *= FNV_64_PRIME;
+                }
+            } else {
+                for (unsigned short ii = 0; ii < valueLength; ++ii) {
+                    hash ^= jo->content[property->valueOffset + ii];
+                    hash *= FNV_64_PRIME;
+                }
+            }
         }
     }
 
@@ -812,7 +1157,28 @@ static void calculateId(jsonObject *jo) {
 #else
     snprintf(jo->idBuffer, sizeof(char) * ID_BUFFER_LENGTH, "$%020llu", hash);
 #endif
-    jo->properties[jo->idIndex].valueLength = 20;
+
+    jsonProperty *property;
+    property = &jo->properties[jo->propertiesLength];
+    jo->idIndex = jo->propertiesLength;
+    ++jo->propertiesLength;
+    if (jo->propertiesLength == MAX_OBJECT_PROPERTIES) {
+        return ERR_EVENT_MAX_PROPERTIES;
+    }
+
+    unsigned int candidate = HASH_ID % MAX_OBJECT_PROPERTIES;
+    while (jo->propertyIndex[candidate] != 0) {
+        candidate = candidate + 1 % MAX_OBJECT_PROPERTIES;
+    }
+
+    // Index intentionally offset by 1 to enable getObject 
+    jo->propertyIndex[candidate] = jo->propertiesLength;
+    property->hash = HASH_ID;
+    property->valueOffset = 0;
+    property->valueLength = 20;
+    property->type = JSON_STRING;
+
+    return RULES_OK;
 }
 
 static unsigned int fixupIds(jsonObject *jo, char generateId) {
@@ -823,7 +1189,6 @@ static unsigned int fixupIds(jsonObject *jo, char generateId) {
         //coerce value to string
         property = &jo->properties[jo->sidIndex];
         if (property->type != JSON_STRING) {
-            ++property->valueLength;
             property->value.s = jo->content + property->valueOffset;
             property->type = JSON_STRING;
         }
@@ -835,10 +1200,19 @@ static unsigned int fixupIds(jsonObject *jo, char generateId) {
             return ERR_EVENT_MAX_PROPERTIES;
         }
 
+        unsigned int candidate = HASH_SID % MAX_OBJECT_PROPERTIES;
+        while (jo->propertyIndex[candidate] != 0) {
+            candidate = candidate + 1 % MAX_OBJECT_PROPERTIES;
+        }
+
+        // Index intentionally offset by 1 to enable getObject 
+        jo->propertyIndex[candidate] = jo->propertiesLength;
+
         strncpy(jo->sidBuffer, "0", 1);
         property->hash = HASH_SID;
         property->valueOffset = 0;
         property->valueLength = 1;
+        property->value.s = jo->sidBuffer;
         property->type = JSON_STRING;
     } 
 
@@ -846,26 +1220,11 @@ static unsigned int fixupIds(jsonObject *jo, char generateId) {
         //coerce value to string
         property = &jo->properties[jo->idIndex];
         if (property->type != JSON_STRING) {
-            ++property->valueLength;
             property->value.s = jo->content + property->valueOffset;
             property->type = JSON_STRING;
         }
-    } else {
-        property = &jo->properties[jo->propertiesLength];
-        jo->idIndex = jo->propertiesLength;
-        ++jo->propertiesLength;
-        if (jo->propertiesLength == MAX_OBJECT_PROPERTIES) {
-            return ERR_EVENT_MAX_PROPERTIES;
-        }
-
-        jo->idBuffer[0] = 0;
-        property->hash = HASH_ID;
-        property->valueOffset = 0;
-        property->valueLength = 0;
-        property->type = JSON_STRING;
-        if (generateId) {
-            calculateId(jo);
-        }
+    } else if (generateId) {
+        return calculateId(jo);
     }
 
     return RULES_OK;
@@ -1046,39 +1405,31 @@ unsigned int constructObject(char *root,
     return (result == PARSE_END ? RULES_OK: result);
 }
 
-unsigned int resolveBinding(void *tree, 
-                            char *sid, 
-                            void **rulesBinding) {  
-    return RULES_OK;
-}
-
 unsigned int getState(unsigned int handle, char *sid, char **state) {
     ruleset *tree;
     RESOLVE_HANDLE(handle, &tree);
 
-    void *rulesBinding = NULL;
     if (!sid) {
         sid = "0";
     }
+    unsigned int sidHash = fnv1Hash32(sid, strlen(sid));
+    unsigned int nodeOffset;
 
-    unsigned int result = resolveBinding(tree, sid, &rulesBinding);
-    if (result != RULES_OK) {
-      return result;
+    GET_FIRST(stateNode, 
+             tree->stateIndex, 
+             MAX_STATE_INDEX_LENGTH, 
+             ((ruleset*)tree)->statePool, 
+             sidHash, 
+             nodeOffset);
+
+    if (nodeOffset == UNDEFINED_HASH_OFFSET) {
+      return ERR_SID_NOT_FOUND;
     }
 
-    return getSession(rulesBinding, sid, state);
+    stateNode *node = STATE_NODE(tree, nodeOffset); 
+
+    return serializeState(node, state);
 }
-
-unsigned int getStateVersion(void *tree, char *sid, unsigned long *stateVersion) {
-    void *rulesBinding = NULL;
-    unsigned int result = resolveBinding(tree, sid, &rulesBinding);
-    if (result != RULES_OK) {
-      return result;
-    }
-
-    return getSessionVersion(rulesBinding, sid, stateVersion);
-}
-
 
 unsigned int deleteState(unsigned int handle, char *sid) {
     ruleset *tree;
@@ -1087,19 +1438,48 @@ unsigned int deleteState(unsigned int handle, char *sid) {
     if (!sid) {
         sid = "0";
     }
-
-    void *rulesBinding = NULL;
-    unsigned int result = resolveBinding(tree, sid, &rulesBinding);
-    if (result != RULES_OK) {
-      return result;
-    }
-
     unsigned int sidHash = fnv1Hash32(sid, strlen(sid));
-    result = deleteSession(tree, rulesBinding, sid, sidHash);
-    if (result != RULES_OK) {
-      return result;
+    unsigned int nodeOffset;
+
+    GET_FIRST(stateNode, 
+             tree->stateIndex, 
+             MAX_STATE_INDEX_LENGTH, 
+             ((ruleset*)tree)->statePool, 
+             sidHash, 
+             nodeOffset);
+
+    if (nodeOffset == UNDEFINED_HASH_OFFSET) {
+      return ERR_SID_NOT_FOUND;
     }
 
-    DELETE(stateNode, tree->stateIndex, MAX_STATE_INDEX_LENGTH, tree->statePool, sidHash);
+    stateNode *node = STATE_NODE(tree, nodeOffset); 
+    free(node->sid);
+
+    for (unsigned int i = 0; i < ((ruleset*)tree)->betaCount; ++i) {
+        betaStateNode *betaNode = &node->betaState[i];
+        free(betaNode->leftFramePool.content);
+        free(betaNode->rightFramePool.content);
+    }
+    free(node->betaState);
+
+    for (unsigned int i = 0; i < ((ruleset*)tree)->connectorCount; ++i) {
+        connectorStateNode *connectorNode = &node->connectorState[i];
+        free(connectorNode->aFramePool.content);
+        free(connectorNode->bFramePool.content);
+    }
+    free(node->connectorState);
+
+    for (unsigned int i = 0; i < ((ruleset*)tree)->actionCount; ++i) {
+        actionStateNode *actionNode = &node->actionState[i];
+        free(actionNode->resultPool.content);
+    }   
+    free(node->actionState);
+
+    DELETE(stateNode, 
+           tree->stateIndex, 
+           MAX_STATE_INDEX_LENGTH, 
+           tree->statePool, 
+           nodeOffset);
+
     return RULES_OK;
 }

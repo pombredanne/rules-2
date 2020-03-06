@@ -1,5 +1,7 @@
 #include "state.h"
 
+//#define _PRINT 1
+
 #define OP_NOP 0
 #define OP_LT 0x01
 #define OP_LTE 0x02
@@ -26,8 +28,13 @@
 #define OP_IANY 0x17
 
 #define NODE_ALPHA 0
-#define NODE_BETA_CONNECTOR 1
-#define NODE_ACTION 2
+#define NODE_BETA 1
+#define NODE_CONNECTOR 2
+#define NODE_ACTION 3
+
+#define GATE_AND 0
+#define GATE_OR 1
+
 #define NODE_M_OFFSET 0
 
 #define MAX_STATE_INDEX_LENGTH 1024
@@ -86,8 +93,11 @@ typedef struct beta {
     expressionSequence expressionSequence;
     unsigned int hash;
     unsigned int nextOffset;
-    unsigned char not;
+    unsigned int aOffset;
+    unsigned int bOffset;
     unsigned char distinct;
+    unsigned char not;
+    unsigned char gateType;
     unsigned char isFirst;
 } beta;
 
@@ -112,6 +122,7 @@ typedef struct ruleset {
     unsigned int nameOffset;
     unsigned int actionCount;
     unsigned int betaCount;
+    unsigned int connectorCount;
     void *bindingsList;
     
     node *nodePool;
@@ -135,4 +146,16 @@ typedef struct ruleset {
     unsigned int currentStateIndex;
 } ruleset;
 
+#ifdef _PRINT
 
+void printSimpleExpression(ruleset *tree, 
+                           expression *currentExpression, 
+                           unsigned char first, 
+                           char *comp);
+
+void printExpressionSequence(ruleset *tree, 
+                             expressionSequence *exprs, 
+                             int level);
+
+
+#endif

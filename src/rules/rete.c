@@ -4,11 +4,10 @@
 #include <time.h>
 #include <string.h>
 #include "rules.h"
-#include "net.h"
 #include "json.h"
 #include "regex.h"
+#include "rete.h"
 
-#define _PRINT 1
 #define HASH_ALL 321211332 // all
 #define HASH_ANY 740945997 // any
 #define HASH_PRI 1450887882 // pri
@@ -1015,9 +1014,9 @@ static unsigned int findAlpha(ruleset *tree,
         type = JSON_IREGEX;
     }
 
-    if (operator == OP_IANY || operator == OP_IALL) {
-        newAlpha->value.a.expression.right.type = JSON_NIL;
-    } else {
+    //if (operator == OP_IANY || operator == OP_IALL) {
+    //    newAlpha->value.a.expression.right.type = JSON_NIL;
+    //} else {
         CHECK_RESULT(copyValue(tree, 
                                &newAlpha->value.a.expression.right, 
                                first, 
@@ -1033,7 +1032,7 @@ static unsigned int findAlpha(ruleset *tree,
                            expr);
             copyExpression(&newAlpha->value.a.expression, expr);
         } 
-    }
+    //}
 
     return linkAlpha(tree, parentOffset, *resultOffset);
 }
@@ -1313,6 +1312,7 @@ static unsigned int createAlpha(ruleset *tree,
 
 static unsigned int createBeta(ruleset *tree, 
                                char *rule,
+                               unsigned char gateType,
                                unsigned short distinct,
                                unsigned int nextOffset) {
     char *first;
@@ -1321,6 +1321,8 @@ static unsigned int createBeta(ruleset *tree,
     unsigned int hash;
     unsigned int previousOffset = 0;
     unsigned char type; 
+    unsigned char nextGateType = GATE_AND;
+
     unsigned int result = readNextArrayValue(rule, 
                                              &first, 
                                              &lastArrayValue, 
@@ -1334,6 +1336,7 @@ static unsigned int createBeta(ruleset *tree,
                 operator = OP_ALL;
             } else if (!strncmp("$any", last - 4, 4)) {
                 operator = OP_ANY;
+                nextGateType = GATE_OR;
             } else if (!strncmp("$not", last - 4, 4)) {
                 operator = OP_NOT;
             }
@@ -1357,21 +1360,40 @@ static unsigned int createBeta(ruleset *tree,
                                &betaOffset));
         
         newBeta->nameOffset = stringOffset;
-        newBeta->type = NODE_BETA_CONNECTOR;
         newBeta->value.b.nextOffset = nextOffset;
-        newBeta->value.b.not = (operator == OP_NOT) ? 1 : 0;
+        newBeta->value.b.aOffset = betaOffset;
+        newBeta->value.b.bOffset = betaOffset;
+        newBeta->value.b.gateType = gateType;
+        newBeta->value.b.not = (operator == OP_NOT) ? 1: 0;
         newBeta->value.b.distinct = (distinct != 0) ? 1 : 0;
         newBeta->value.b.hash = hash;
-        newBeta->value.b.index = tree->betaCount;
-        ++tree->betaCount;
         
+        if (operator != OP_ALL && operator != OP_ANY) {
+            newBeta->value.b.index = tree->betaCount;
+            ++tree->betaCount;
+            newBeta->type = NODE_BETA;
+        } else {
+            newBeta->value.b.index = tree->connectorCount;
+            ++tree->connectorCount;
+            newBeta->type = NODE_CONNECTOR;
+        }
+
         if (previousOffset == 0) {
             newBeta->value.b.isFirst = 1;
         } else {
             newBeta->value.b.isFirst = 0;
             tree->nodePool[previousOffset].value.b.nextOffset = betaOffset;
+            if (newBeta->type == NODE_CONNECTOR) {
+                // always set 'a' to previous beta in array
+                newBeta->value.b.aOffset = previousOffset;
+            }
         } 
 
+        if (tree->nodePool[nextOffset].type == NODE_CONNECTOR) {
+            // always set 'b' to last beta in array
+            tree->nodePool[nextOffset].value.b.bOffset = betaOffset;
+        }
+        
         previousOffset = betaOffset;
 
         newBeta->value.b.expressionSequence.nameOffset = stringOffset;
@@ -1398,7 +1420,8 @@ static unsigned int createBeta(ruleset *tree,
                                              &type));
 
             CHECK_RESULT(createBeta(tree, 
-                                    first, 
+                                    first,
+                                    nextGateType, 
                                     distinct, 
                                     betaOffset));
         }
@@ -1472,7 +1495,53 @@ static void printExpression(ruleset *tree, operand *newValue) {
     }
 }
 
-static void printExpressionSequence(ruleset *tree, expressionSequence *exprs, int level) {
+void printSimpleExpression(ruleset *tree, expression *currentExpression, unsigned char first, char *comp) {
+    if (currentExpression->operator == OP_IALL || currentExpression->operator == OP_IANY) {
+        char *leftProperty = &tree->stringPool[currentExpression->left.value.id.propertyNameOffset];
+        printf("compare array: %s", leftProperty);
+    } else {
+        char *op = "";
+        switch (currentExpression->operator) {
+            case OP_LT:
+                op = "<";
+                break;
+            case OP_LTE:
+                op = "<=";
+                break;
+            case OP_GT:
+                op = ">";
+                break;
+            case OP_GTE:
+                op = ">=";
+                break;
+            case OP_EQ:
+                op = "==";
+                break;
+            case OP_NEQ:
+                op = "!=";
+                break;
+            case OP_NOP:
+            case OP_NEX:
+            case OP_EX:
+            case OP_TYPE:
+            case OP_MT:
+            case OP_IMT:
+                return;
+        }
+
+        char *leftProperty = &tree->stringPool[currentExpression->left.value.id.propertyNameOffset];
+        if (!first) {
+            printf(" %s message[\"%s\"] %s ", comp, leftProperty, op);
+        } else {
+            printf("message[\"%s\"] %s ", leftProperty, op);   
+        }
+
+        printExpression(tree, &currentExpression->right);
+    }
+
+}
+
+void printExpressionSequence(ruleset *tree, expressionSequence *exprs, int level) {
     for (int i = 0; i < level; ++ i) {
         printf("    ");
     }
@@ -1504,82 +1573,9 @@ static void printExpressionSequence(ruleset *tree, expressionSequence *exprs, in
             --compTop;
             comp = compStack[compTop];
             printf(")");            
-        } else if (currentExpression->operator == OP_IALL || currentExpression->operator == OP_IANY) {
-            char *leftProperty = &tree->stringPool[currentExpression->left.value.id.propertyNameOffset];
-            expression *newExpression = &tree->expressionPool[currentExpression->right.value.expressionOffset];
-            char *op = "";
-            switch (newExpression->operator) {
-                case OP_LT:
-                    op = "<";
-                    break;
-                case OP_LTE:
-                    op = "<=";
-                    break;
-                case OP_GT:
-                    op = ">";
-                    break;
-                case OP_GTE:
-                    op = ">=";
-                    break;
-                case OP_EQ:
-                    op = "==";
-                    break;
-                case OP_NEQ:
-                    op = "!=";
-                    break;
-            }
-
-            char *par = "";
-            if (currentExpression->operator == OP_IALL) {
-                par = "true";
-            } else {
-                par = "false";
-            }
-
-            if (!first) {
-                printf("%s compare_array(message[\"%s\"], ", comp, leftProperty);
-
-            } else {
-                printf("compare_array(message[\"%s\"], ", leftProperty);
-                first = 0;   
-            }
-
-            printExpression(tree, &newExpression->right);
-            printf(", %s, %s)\n", op, par);
-
         } else {
-            char *leftProperty = &tree->stringPool[currentExpression->left.value.id.propertyNameOffset];
-            char *op = "";
-            switch (currentExpression->operator) {
-                case OP_LT:
-                    op = "<";
-                    break;
-                case OP_LTE:
-                    op = "<=";
-                    break;
-                case OP_GT:
-                    op = ">";
-                    break;
-                case OP_GTE:
-                    op = ">=";
-                    break;
-                case OP_EQ:
-                    op = "==";
-                    break;
-                case OP_NEQ:
-                    op = "!=";
-                    break;
-            }
-
-            if (!first) {
-                printf(" %s message[\"%s\"] %s ", comp, leftProperty, op);
-            } else {
-                printf("message[\"%s\"] %s ", leftProperty, op);
-    
-                first = 0;   
-            }
-
-            printExpression(tree, &currentExpression->right);
+            printSimpleExpression(tree, currentExpression, first, comp);
+            first = 0;
         }
     }
     printf("\n");
@@ -1590,11 +1586,12 @@ static void printActionNode(ruleset *tree, node *actionNode, int level, unsigned
         printf("    ");
     }
 
-    printf("-> action: name %s, count %d, cap %d, priority %d, offset %u\n", 
+    printf("-> action: name %s, count %d, cap %d, priority %d, index %d, offset %u\n", 
           &tree->stringPool[actionNode->nameOffset],
           actionNode->value.c.count,
           actionNode->value.c.cap,
           actionNode->value.c.priority,
+          actionNode->value.c.index,
           offset);
 }
 
@@ -1603,7 +1600,21 @@ static void printBetaNode(ruleset *tree, node *betaNode, int level, unsigned int
         printf("    ");
     }
 
-    printf("-> beta: name %s, not %d, distinct %d, index %d, offset %u\n", &tree->stringPool[betaNode->nameOffset], betaNode->value.b.not, betaNode->value.b.distinct, betaNode->value.b.index, offset);
+    if (betaNode->type == NODE_BETA) {
+        printf("-> beta: ");
+    } else {
+        printf("-> connector: ");
+    }
+    printf("name %s, isFirst %d, not %d, distinct %d, gate %d, index %d, a %d, b %d, offset %u\n", 
+           &tree->stringPool[betaNode->nameOffset],
+           betaNode->value.b.isFirst,  
+           betaNode->value.b.not, 
+           betaNode->value.b.distinct, 
+           betaNode->value.b.gateType, 
+           betaNode->value.b.index,
+           betaNode->value.b.aOffset,
+           betaNode->value.b.bOffset,
+           offset);
     if (betaNode->value.b.expressionSequence.length != 0) {
         printExpressionSequence(tree, &betaNode->value.b.expressionSequence, level);
     }
@@ -1620,7 +1631,15 @@ static void printAlphaNode(ruleset *tree, node *alphaNode, int level, unsigned i
         printf("    ");
     }
 
-    printf("-> alpha: name %s, operator %x, offset %u\n", &tree->stringPool[alphaNode->nameOffset], alphaNode->value.a.expression.operator, offset);
+    printf("-> alpha: name %s, offset %u\n", &tree->stringPool[alphaNode->nameOffset], offset);
+    
+    for (int i = 0; i < level; ++ i) {
+        printf("    ");
+    }
+
+    printSimpleExpression(tree, &alphaNode->value.a.expression, 1, NULL);
+
+    printf("\n");
     if (alphaNode->value.a.nextOffset) {
         unsigned int *nextHashset = &tree->nextPool[alphaNode->value.a.nextOffset];
         for (unsigned int entry = 0; entry < NEXT_BUCKET_LENGTH; ++entry) { 
@@ -1659,7 +1678,7 @@ static unsigned int createTree(ruleset *tree, char *rules) {
                                        &firstName, 
                                        &lastName, 
                                        &hash);
-    node *ruleActions[MAX_ACTIONS];
+    unsigned int ruleActions[MAX_ACTIONS];
     while (result == PARSE_OK) {
         node *ruleAction;
         unsigned int actionOffset;
@@ -1672,7 +1691,7 @@ static unsigned int createTree(ruleset *tree, char *rules) {
         }
 
         ruleAction->value.c.index = tree->actionCount;
-        ruleActions[tree->actionCount] = ruleAction;
+        ruleActions[tree->actionCount] = actionOffset;
         ++tree->actionCount;
         ruleAction->type = NODE_ACTION;
         
@@ -1709,15 +1728,19 @@ static unsigned int createTree(ruleset *tree, char *rules) {
         //Ensure action index is assigned based on priority
         unsigned int currentIndex = ruleAction->value.c.index;
         while (currentIndex) {
-            if (ruleActions[currentIndex]->value.c.priority >= ruleActions[currentIndex - 1]->value.c.priority) {
+            node *currentAction = &tree->nodePool[ruleActions[currentIndex]];
+            node *previousAction = &tree->nodePool[ruleActions[currentIndex - 1]];
+            if (currentAction->value.c.priority >= previousAction->value.c.priority) {
                 break;
             } else {
-                node *tempAction = ruleActions[currentIndex];
+                unsigned int tempAction = ruleActions[currentIndex];
                 ruleActions[currentIndex] = ruleActions[currentIndex - 1];
-                ruleActions[currentIndex]->value.c.index = currentIndex;
-                ruleActions[currentIndex - 1] = tempAction;
-                ruleActions[currentIndex - 1]->value.c.index = currentIndex - 1;  
-                --currentIndex; 
+                previousAction->value.c.index = currentIndex;
+
+                --currentIndex;
+
+                ruleActions[currentIndex] = tempAction;
+                currentAction->value.c.index = currentIndex;
             }
         }
 
@@ -1738,6 +1761,7 @@ static unsigned int createTree(ruleset *tree, char *rules) {
             if (hash == HASH_ANY || hash == HASH_ALL) {
                 CHECK_RESULT(createBeta(tree, 
                                         first, 
+                                        (hash == HASH_ALL) ? GATE_AND : GATE_OR,
                                         distinct, 
                                         actionOffset));        
             }
@@ -1796,10 +1820,11 @@ unsigned int createRuleset(unsigned int *handle, char *name, char *rules) {
     tree->regexStateMachinePool = NULL;
     tree->regexStateMachineOffset = 0;
     tree->betaCount = 0;
+    tree->connectorCount = 0;
     tree->actionCount = 0;
     tree->bindingsList = NULL;
     tree->currentStateIndex = 0;
-    memset(tree->stateIndex, 0, MAX_STATE_INDEX_LENGTH * sizeof(unsigned int));
+    memset(tree->stateIndex, 0, MAX_STATE_INDEX_LENGTH * sizeof(unsigned int) * 2);
     memset(tree->reverseStateIndex, 0, MAX_STATE_INDEX_LENGTH * sizeof(unsigned int));
     initStatePool(tree);
     
@@ -1816,13 +1841,13 @@ unsigned int createRuleset(unsigned int *handle, char *name, char *rules) {
     CHECK_RESULT(storeAlpha(tree, 
                             &newNode, 
                             &nodeOffset));
-    
+
     newNode->nameOffset = stringOffset;
     newNode->type = NODE_ALPHA;
     newNode->value.a.expression.operator = OP_TYPE;
+
     // will use random numbers for state stored event mids
     srand(time(NULL));
-
     CREATE_HANDLE(tree, handle);
     return createTree(tree, rules);
 }
@@ -1831,54 +1856,10 @@ unsigned int deleteRuleset(unsigned int handle) {
     ruleset *tree;
     RESOLVE_HANDLE(handle, &tree);
 
-    deleteBindingsList(tree);
     free(tree->nodePool);
     free(tree->nextPool);
     free(tree->stringPool);
     free(tree->expressionPool);
-    free(tree->statePool.content);
-    free(tree);
-    DELETE_HANDLE(handle);
-    return RULES_OK;
-}
-
-unsigned int createClient(unsigned int *handle, char *name) {
-    INITIALIZE_ENTRIES;
-
-    ruleset *tree = malloc(sizeof(ruleset));
-    if (!tree) {
-        return ERR_OUT_OF_MEMORY;
-    }
-    
-    tree->stringPool = NULL;
-    tree->stringPoolLength = 0;
-    tree->nodePool = NULL;
-    tree->nodeOffset = 0;
-    tree->nextPool = NULL;
-    tree->nextOffset = 0;
-    tree->expressionPool = NULL;
-    tree->expressionOffset = 0;
-    tree->actionCount = 0;
-    tree->betaCount = 0;
-    tree->bindingsList = NULL;
-    memset(tree->stateIndex, 0, MAX_STATE_INDEX_LENGTH * sizeof(unsigned int));
-    initStatePool(tree);
-    
-    CHECK_RESULT(storeString(tree, 
-                             name, 
-                             &tree->nameOffset, 
-                             strlen(name)));
-    
-    CREATE_HANDLE(tree, handle);
-    return RULES_OK;
-}
-
-unsigned int deleteClient(unsigned int handle) {
-    ruleset *tree;
-    RESOLVE_HANDLE(handle, &tree);
-    
-    deleteBindingsList(tree);
-    free(tree->stringPool);
     free(tree->statePool.content);
     free(tree);
     DELETE_HANDLE(handle);

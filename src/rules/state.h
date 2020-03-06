@@ -1,4 +1,6 @@
 
+#include <time.h> 
+
 #define HASH_ID 926444256
 #define HASH_SID 3593476751
 #define UNDEFINED_INDEX 0xFFFFFFFF
@@ -9,17 +11,20 @@
 #define MESSAGE_TYPE_FACT 1
 
 #define UNDEFINED_HASH_OFFSET 0
-#define MAX_OBJECT_PROPERTIES 64
-#define MAX_MESSAGE_FRAMES 32
-#define MAX_MESSAGE_INDEX_LENGTH 16384
-#define MAX_LEFT_FRAME_INDEX_LENGTH 1024
-#define MAX_RIGHT_FRAME_INDEX_LENGTH 1024
-#define MAX_FRAME_LOCATIONS 128
+#define MAX_OBJECT_PROPERTIES 32
+#define MAX_MESSAGE_FRAMES 16
+#define MAX_MESSAGE_INDEX_LENGTH 512
+#define MAX_LEFT_FRAME_INDEX_LENGTH 512
+#define MAX_RIGHT_FRAME_INDEX_LENGTH 512
+#define MAX_LOCATION_INDEX_LENGTH 16
 
 #define LEFT_FRAME 0
 #define RIGHT_FRAME 1
-#define ACTION_FRAME 2
+#define A_FRAME 2
+#define B_FRAME 3
+#define ACTION_FRAME 4
 
+#define STATE_LEASE_TIME 30 
 
 #define MESSAGE_NODE(state, offset) &((messageNode *)state->messagePool.content)[offset]
 
@@ -27,14 +32,28 @@
 
 #define LEFT_FRAME_NODE(state, index, offset) &((leftFrameNode *)state->betaState[index].leftFramePool.content)[offset]
 
+#define A_FRAME_NODE(state, index, offset) &((leftFrameNode *)state->connectorState[index].aFramePool.content)[offset]
+
+#define B_FRAME_NODE(state, index, offset) &((leftFrameNode *)state->connectorState[index].bFramePool.content)[offset]
+
 #define ACTION_FRAME_NODE(state, index, offset) &((leftFrameNode *)state->actionState[index].resultPool.content)[offset]
 
 #define RESULT_FRAME(actionNode, offset) &((leftFrameNode *)actionNode->resultPool.content)[offset];
 
 #define STATE_NODE(tree, offset) &((stateNode *)((ruleset *)tree)->statePool.content)[offset]
 
+#define LOCATION_NODE(message, offset) &((locationNode *)message->locationPool.content)[offset]
+
+
 // defined in rete.h
 struct node;
+
+typedef struct pool {
+    void *content;
+    unsigned int freeOffset;
+    unsigned int contentLength;
+    unsigned int count;
+} pool;
 
 typedef struct jsonProperty {
     unsigned int hash;
@@ -61,10 +80,18 @@ typedef struct jsonObject {
 } jsonObject;
 
 typedef struct frameLocation {
-  unsigned char frameType;
-  unsigned int nodeIndex;
-  unsigned int frameOffset;
+    unsigned char frameType;
+    unsigned int nodeIndex;
+    unsigned int frameOffset;
 } frameLocation;
+
+typedef struct locationNode {
+    unsigned int prevOffset;
+    unsigned int nextOffset;
+    unsigned int hash;
+    frameLocation location;
+    unsigned char isActive;
+} locationNode;
 
 typedef struct messageNode {
     unsigned int prevOffset;
@@ -72,8 +99,8 @@ typedef struct messageNode {
     unsigned int hash;
     unsigned char isActive;
     unsigned char messageType;
-    unsigned short locationCount;
-    frameLocation locations[MAX_FRAME_LOCATIONS];
+    pool locationPool;
+    unsigned int locationIndex[MAX_LOCATION_INDEX_LENGTH * 2];
     jsonObject jo;
 } messageNode;
 
@@ -89,6 +116,7 @@ typedef struct leftFrameNode {
     unsigned int nameOffset;
     unsigned int hash;
     unsigned char isActive;
+    unsigned char isDispatching;
     unsigned short messageCount;
     unsigned short reverseIndex[MAX_MESSAGE_FRAMES];
     messageFrame messages[MAX_MESSAGE_FRAMES];
@@ -102,40 +130,51 @@ typedef struct rightFrameNode {
     unsigned int messageOffset;
 } rightFrameNode;
 
-typedef struct pool {
-    void *content;
-    unsigned int freeOffset;
-    unsigned int contentLength;
-    unsigned int count;
-} pool;
-
 typedef struct actionStateNode {
     struct node *reteNode;
     pool resultPool;
-    unsigned int resultIndex[1];
-    unsigned short count;
-    unsigned short cap;
+    unsigned int resultIndex[2];
 } actionStateNode;
+
+typedef struct connectorStateNode {
+    struct node *reteNode;
+    pool aFramePool;
+    unsigned int aFrameIndex[2];
+    pool bFramePool;
+    unsigned int bFrameIndex[2];
+} connectorStateNode;
 
 typedef struct betaStateNode {
     struct node *reteNode;
     pool leftFramePool;
-    unsigned int leftFrameIndex[MAX_LEFT_FRAME_INDEX_LENGTH];
+    unsigned int leftFrameIndex[MAX_LEFT_FRAME_INDEX_LENGTH * 2];
     pool rightFramePool;
-    unsigned int rightFrameIndex[MAX_RIGHT_FRAME_INDEX_LENGTH];
+    unsigned int rightFrameIndex[MAX_RIGHT_FRAME_INDEX_LENGTH * 2];
 } betaStateNode;
 
+typedef struct actionContext {
+    unsigned int actionStateIndex;
+    unsigned int resultCount;
+    unsigned int resultFrameOffset;
+    char *messages;
+    char *stateFact;
+} actionContext;
+
 typedef struct stateNode {
+    char *sid;
+    time_t lockExpireTime;
+    unsigned int offset;
     unsigned int prevOffset;
     unsigned int nextOffset;
+    unsigned int factOffset;
     unsigned int hash;
     unsigned char isActive;
-    unsigned int bindingIndex;
-    unsigned int factOffset;
     pool messagePool;
-    unsigned int messageIndex[MAX_MESSAGE_INDEX_LENGTH];
+    unsigned int messageIndex[MAX_MESSAGE_INDEX_LENGTH * 2];
     betaStateNode *betaState;
     actionStateNode *actionState; 
+    connectorStateNode *connectorState;
+    actionContext context;
 } stateNode;
 
 
@@ -167,9 +206,17 @@ unsigned int getHash(char *sid, char *key);
 
 unsigned int initStatePool(void *tree);
 
-unsigned int appendFrameLocation(stateNode *state,
-                                 frameLocation location,
-                                 unsigned int messageNodeOffset);
+unsigned int addFrameLocation(stateNode *state,
+                              frameLocation location,
+                              unsigned int messageNodeOffset);
+
+unsigned int deleteFrameLocation(stateNode *state,
+                                 unsigned int messageNodeOffset,
+                                 frameLocation location);
+
+
+unsigned int deleteMessageFromFrame(unsigned int messageNodeOffset, 
+                                    leftFrameNode *frame);
 
 unsigned int getMessageFromFrame(stateNode *state,
                                  messageFrame *messages,
@@ -181,11 +228,11 @@ unsigned int setMessageInFrame(leftFrameNode *node,
                                unsigned int hash, 
                                unsigned int messageNodeOffset);
 
-unsigned int getLeftFrame(stateNode *state,
-                          unsigned int index, 
-                          unsigned int hash,
-                          frameLocation *location,
-                          leftFrameNode **node);
+unsigned int getLastLeftFrame(stateNode *state,
+                              unsigned int index, 
+                              unsigned int hash,
+                              frameLocation *location,
+                              leftFrameNode **node);
 
 unsigned int setLeftFrame(stateNode *state,
                           unsigned int hash, 
@@ -201,7 +248,29 @@ unsigned int createLeftFrame(stateNode *state,
                              leftFrameNode **newNode,
                              frameLocation *newLocation);
 
-unsigned int getRightFrame(stateNode *state,
+unsigned int getLastConnectorFrame(stateNode *state,
+                                   unsigned int frameType,
+                                   unsigned int index, 
+                                   unsigned int *valueOffset,
+                                   leftFrameNode **node);
+
+unsigned int setConnectorFrame(stateNode *state, 
+                               unsigned int frameType,
+                               frameLocation location);
+
+
+unsigned int deleteConnectorFrame(stateNode *state,
+                                  unsigned int frameType,
+                                  frameLocation location);
+
+unsigned int createConnectorFrame(stateNode *state,
+                                  unsigned int frameType,
+                                  struct node *reteNode,
+                                  leftFrameNode *oldNode,                        
+                                  leftFrameNode **newNode,
+                                  frameLocation *newLocation);
+
+unsigned int getLastRightFrame(stateNode *state,
                            unsigned int index, 
                            unsigned int hash,
                            rightFrameNode **node);
@@ -219,8 +288,7 @@ unsigned int createRightFrame(stateNode *state,
                               frameLocation *location);
 
 unsigned int getActionFrame(stateNode *state,
-                            unsigned int index, 
-                            frameLocation *resultLocation,
+                            frameLocation resultLocation,
                             leftFrameNode **resultNode);
 
 unsigned int setActionFrame(stateNode *state, 
@@ -230,19 +298,17 @@ unsigned int setActionFrame(stateNode *state,
 unsigned int deleteActionFrame(stateNode *state,
                                frameLocation location);
 
+unsigned int deleteDispatchingActionFrame(stateNode *state,
+                                          frameLocation location);
+
 unsigned int createActionFrame(stateNode *state,
                                struct node *reteNode,
                                leftFrameNode *oldNode,                        
                                leftFrameNode **newNode,
                                frameLocation *newLocation);
 
-unsigned int deleteLocationFromMessage(stateNode *state,
-                                       unsigned int messageNodeOffset,
-                                       frameLocation location);
-
 unsigned int deleteMessage(stateNode *state,
                            unsigned int messageNodeOffset);
-
 
 unsigned int getMessage(stateNode *state,
                         char *mid,
@@ -262,14 +328,25 @@ unsigned int ensureStateNode(void *tree,
 unsigned int serializeResult(void *tree, 
                              stateNode *state, 
                              actionStateNode *actionNode, 
+                             unsigned int count,
                              char **result);
 
 unsigned int serializeState(stateNode *state, 
                             char **stateFact);
 
+unsigned int getNextResultInState(void *tree, 
+                                  stateNode *state,
+                                  unsigned int *actionStateIndex,
+                                  unsigned int *resultCount,
+                                  unsigned int *resultFrameOffset, 
+                                  actionStateNode **resultAction);
+
 unsigned int getNextResult(void *tree, 
+                           time_t currentTime,
                            stateNode **resultState, 
-                           unsigned int *actionIndex,
+                           unsigned int *actionStateIndex,
+                           unsigned int *resultCount,
+                           unsigned int *resultFrameOffset, 
                            actionStateNode **resultAction);
 
 
